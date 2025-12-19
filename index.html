@@ -1,0 +1,724 @@
+// Single-file React app (Vite-style) — калькулятор гидрации
+// Фишки:
+// 1) Фиксация параметров (чекбоксы): можно фиксировать любые поля.
+// 2) Пресеты типа теста: меняют целевую гидрацию (и диапазон ползунка) + соль по умолчанию.
+// 3) Отдельный блок добавок (соль/жир/мёд) — НЕ влияет на гидрацию, но считает граммы.
+// 4) Сохранение расчётов: localStorage (сохранить/загрузить/удалить).
+
+import { useEffect, useMemo, useState } from "react";
+
+const STORAGE_KEY = "dough_hydration_saves_v2";
+
+const PRESETS = [
+  {
+    key: "custom",
+    title: "Кастом",
+    note: "Ничего не меняет автоматически.",
+    hydration: 70,
+    sliderMin: 50,
+    sliderMax: 90,
+    saltPct: 2.0,
+  },
+  {
+    key: "baguette",
+    title: "Багет",
+    note: "Обычно 65–75% (зависит от муки и техники).",
+    hydration: 70,
+    sliderMin: 60,
+    sliderMax: 80,
+    saltPct: 2.0,
+  },
+  {
+    key: "batard",
+    title: "Батард / деревенский",
+    note: "Часто 68–78%.",
+    hydration: 72,
+    sliderMin: 60,
+    sliderMax: 85,
+    saltPct: 2.0,
+  },
+  {
+    key: "ciabatta",
+    title: "Чиабатта",
+    note: "Обычно 75–85%.",
+    hydration: 80,
+    sliderMin: 70,
+    sliderMax: 90,
+    saltPct: 2.0,
+  },
+  {
+    key: "wholewheat",
+    title: "Цельнозерно",
+    note: "Часто просит выше гидрацию. Начни с 75–85%.",
+    hydration: 78,
+    sliderMin: 65,
+    sliderMax: 90,
+    saltPct: 2.0,
+  },
+  {
+    key: "rye",
+    title: "Ржаное (частично/полностью)",
+    note: "Гидрация сильно зависит от доли ржи. Для старта 80–95%.",
+    hydration: 85,
+    sliderMin: 70,
+    sliderMax: 100,
+    saltPct: 2.0,
+  },
+];
+
+const defaultStarters = [
+  { id: 1, name: "Пулиш", weight: 120, hydration: 95 },
+  { id: 2, name: "Густая закваска", weight: 80, hydration: 60 },
+];
+
+function splitStarter(weight, hydration) {
+  const flour = weight / (1 + hydration / 100);
+  const water = weight - flour;
+  return { flour, water };
+}
+
+function clampNumber(x, min = -1e9, max = 1e9) {
+  if (Number.isNaN(x) || !Number.isFinite(x)) return 0;
+  return Math.max(min, Math.min(max, x));
+}
+
+function round1(x) {
+  return Math.round(x * 10) / 10;
+}
+
+function fmtDate(iso) {
+  try {
+    return new Date(iso).toLocaleString();
+  } catch {
+    return iso;
+  }
+}
+
+export default function App() {
+  // Пресет
+  const [presetKey, setPresetKey] = useState("custom");
+  const preset = useMemo(() => PRESETS.find((p) => p.key === presetKey) || PRESETS[0], [presetKey]);
+  const [sliderMin, setSliderMin] = useState(preset.sliderMin);
+  const [sliderMax, setSliderMax] = useState(preset.sliderMax);
+
+  // Закваски
+  const [starters, setStarters] = useState(defaultStarters);
+
+  // Основные поля расчёта
+  const [hydration, setHydration] = useState(preset.hydration); // %
+  const [finalWeight, setFinalWeight] = useState(750); // г
+  const [flourToAdd, setFlourToAdd] = useState(0); // г
+  const [waterToAdd, setWaterToAdd] = useState(0); // г
+
+  // Фиксация параметров (чекбоксы)
+  // По умолчанию фиксируем гидрацию + итоговый вес.
+  const [locked, setLocked] = useState({
+    hydration: true,
+    finalWeight: true,
+    flourToAdd: false,
+    waterToAdd: false,
+  });
+
+  // Блок добавок (НЕ влияет на гидрацию)
+  // Проценты от СУММАРНОЙ муки (включая муку из заквасок)
+  const [saltPct, setSaltPct] = useState(preset.saltPct); // %
+  const [fatPct, setFatPct] = useState(0); // масло/жир %
+  const [honeyPct, setHoneyPct] = useState(0); // мёд/сахар %
+
+  // Сохранения
+  const [saves, setSaves] = useState([]);
+  const [saveName, setSaveName] = useState("");
+
+  // Загрузка сохранений
+  useEffect(() => {
+    try {
+      const raw = localStorage.getItem(STORAGE_KEY);
+      if (!raw) return;
+      const parsed = JSON.parse(raw);
+      if (Array.isArray(parsed)) setSaves(parsed);
+    } catch {
+      // ignore
+    }
+  }, []);
+
+  // Применение пресета
+  // Меняем: рекомендуемую гидрацию, диапазон ползунка, соль по умолчанию.
+  // Но делаем это мягко:
+  // - Если гидрация сейчас фиксирована, обновляем её значением пресета.
+  // - Если пользователь уже руками задал соль (не равна текущей), не трогаем.
+  useEffect(() => {
+    setSliderMin(preset.sliderMin);
+    setSliderMax(preset.sliderMax);
+
+    if (locked.hydration) {
+      setHydration(preset.hydration);
+    }
+
+    // если соль ещё "по умолчанию" — подстроим
+    setSaltPct((prev) => {
+      // эвристика: если пользователь не менял соль (равна старому пресету), обновим
+      // (в реальности не идеальная, но удобная)
+      return prev === PRESETS.find((p) => p.key === "custom")?.saltPct || prev === preset.saltPct
+        ? preset.saltPct
+        : prev;
+    });
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [presetKey]);
+
+  const startersTotals = useMemo(() => {
+    return starters.reduce(
+      (acc, s) => {
+        const { flour, water } = splitStarter(s.weight, s.hydration);
+        acc.flour += flour;
+        acc.water += water;
+        return acc;
+      },
+      { flour: 0, water: 0 }
+    );
+  }, [starters]);
+
+  // --- SOLVER ---
+  // Модель:
+  // totalFlour = startersFlour + flourToAdd
+  // totalWater = startersWater + waterToAdd
+  // hydration = totalWater / totalFlour
+  // finalWeight = totalFlour + totalWater
+  //
+  // Для однозначности нужно 2 независимых "фиксации" среди 4 параметров.
+  // Мы решаем уравнения по доступным зафиксированным полям.
+
+  const solved = useMemo(() => {
+    const Fs = startersTotals.flour;
+    const Ws = startersTotals.water;
+
+    let H = hydration / 100;
+    let fw = finalWeight;
+    let fa = flourToAdd;
+    let wa = waterToAdd;
+
+    // Набор фиксированных
+    const fixed = {
+      hydration: locked.hydration,
+      finalWeight: locked.finalWeight,
+      flourToAdd: locked.flourToAdd,
+      waterToAdd: locked.waterToAdd,
+    };
+
+    // Вспомогательные значения, если гидрация не фиксирована — будем её вычислять.
+    const haveHW = fixed.hydration && fixed.finalWeight;
+    const haveHF = fixed.hydration && fixed.flourToAdd;
+    const haveHWA = fixed.hydration && fixed.waterToAdd;
+
+    const haveFWF = fixed.finalWeight && fixed.flourToAdd;
+    const haveFWW = fixed.finalWeight && fixed.waterToAdd;
+    const haveFAWA = fixed.flourToAdd && fixed.waterToAdd;
+
+    // CASE 1: H + finalWeight
+    if (haveHW) {
+      const safeH = Math.max(0, H);
+      const totalFlour = fw / (1 + safeH);
+      const totalWater = totalFlour * safeH;
+      fa = totalFlour - Fs;
+      wa = totalWater - Ws;
+    }
+
+    // CASE 2: H + flourToAdd
+    else if (haveHF) {
+      const safeH = Math.max(0, H);
+      const totalFlour = Fs + fa;
+      const totalWater = totalFlour * safeH;
+      wa = totalWater - Ws;
+      fw = totalFlour + totalWater;
+    }
+
+    // CASE 3: H + waterToAdd
+    else if (haveHWA) {
+      const safeH = Math.max(0, H);
+      const totalWater = Ws + wa;
+      const totalFlour = safeH > 0 ? totalWater / safeH : 0;
+      fa = totalFlour - Fs;
+      fw = totalFlour + totalWater;
+    }
+
+    // CASE 4: finalWeight + flourToAdd (H вычисляем)
+    else if (haveFWF) {
+      const totalFlour = Fs + fa;
+      const totalWater = fw - totalFlour;
+      wa = totalWater - Ws;
+      H = totalFlour > 0 ? totalWater / totalFlour : 0;
+    }
+
+    // CASE 5: finalWeight + waterToAdd (H вычисляем)
+    else if (haveFWW) {
+      const totalWater = Ws + wa;
+      const totalFlour = fw - totalWater;
+      fa = totalFlour - Fs;
+      H = totalFlour > 0 ? totalWater / totalFlour : 0;
+    }
+
+    // CASE 6: flourToAdd + waterToAdd (H и finalWeight вычисляем)
+    else if (haveFAWA) {
+      const totalFlour = Fs + fa;
+      const totalWater = Ws + wa;
+      fw = totalFlour + totalWater;
+      H = totalFlour > 0 ? totalWater / totalFlour : 0;
+    }
+
+    // CASE 7: недостаточно фиксаций — используем дефолт: H + finalWeight
+    else {
+      const safeH = Math.max(0, H);
+      const totalFlour = fw / (1 + safeH);
+      const totalWater = totalFlour * safeH;
+      fa = totalFlour - Fs;
+      wa = totalWater - Ws;
+    }
+
+    const totalFlour = Fs + fa;
+    const totalWater = Ws + wa;
+
+    return {
+      hydration: clampNumber(H * 100, 0, 200),
+      finalWeight: clampNumber(fw, 0, 1e7),
+      flourToAdd: clampNumber(fa, -1e7, 1e7),
+      waterToAdd: clampNumber(wa, -1e7, 1e7),
+      totals: {
+        startersFlour: Fs,
+        startersWater: Ws,
+        totalFlour,
+        totalWater,
+      },
+    };
+  }, [startersTotals, hydration, finalWeight, flourToAdd, waterToAdd, locked]);
+
+  // Синхронизация отображаемых значений: обновляем только НЕ зафиксированные.
+  useEffect(() => {
+    setHydration((prev) => (locked.hydration ? prev : round1(solved.hydration)));
+    setFinalWeight((prev) => (locked.finalWeight ? prev : round1(solved.finalWeight)));
+    setFlourToAdd((prev) => (locked.flourToAdd ? prev : round1(solved.flourToAdd)));
+    setWaterToAdd((prev) => (locked.waterToAdd ? prev : round1(solved.waterToAdd)));
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [solved.hydration, solved.finalWeight, solved.flourToAdd, solved.waterToAdd]);
+
+  // Добавки (граммы) — от суммарной муки
+  const additives = useMemo(() => {
+    const flour = solved.totals.totalFlour;
+    const saltG = flour * (saltPct / 100);
+    const fatG = flour * (fatPct / 100);
+    const honeyG = flour * (honeyPct / 100);
+    return {
+      flour,
+      saltG,
+      fatG,
+      honeyG,
+      totalG: saltG + fatG + honeyG,
+    };
+  }, [solved.totals.totalFlour, saltPct, fatPct, honeyPct]);
+
+  const updateStarter = (id, field, value) => {
+    setStarters((prev) => prev.map((s) => (s.id === id ? { ...s, [field]: value } : s)));
+  };
+
+  const inputClass = (isLocked) =>
+    `border rounded px-2 py-2 w-full transition ${
+      isLocked
+        ? "bg-blue-50 border-blue-300 focus:ring-2 focus:ring-blue-200"
+        : "bg-gray-50 border-gray-200 focus:ring-2 focus:ring-gray-200"
+    }`;
+
+  const pill = (isLocked) =>
+    `text-xs px-2 py-1 rounded-full ${isLocked ? "bg-blue-100 text-blue-700" : "bg-gray-100 text-gray-700"}`;
+
+  const toggleLock = (field) => {
+    setLocked((prev) => ({ ...prev, [field]: !prev[field] }));
+  };
+
+  const persistSaves = (next) => {
+    setSaves(next);
+    try {
+      localStorage.setItem(STORAGE_KEY, JSON.stringify(next));
+    } catch {
+      // ignore
+    }
+  };
+
+  const doSave = () => {
+    const name = (saveName || "Расчёт").trim();
+    const item = {
+      id: crypto?.randomUUID ? crypto.randomUUID() : String(Date.now()),
+      name,
+      createdAt: new Date().toISOString(),
+      data: {
+        presetKey,
+        sliderMin,
+        sliderMax,
+        starters,
+        fields: {
+          hydration: round1(solved.hydration),
+          finalWeight: round1(solved.finalWeight),
+          flourToAdd: round1(solved.flourToAdd),
+          waterToAdd: round1(solved.waterToAdd),
+        },
+        locked,
+        additives: {
+          saltPct,
+          fatPct,
+          honeyPct,
+        },
+      },
+    };
+    persistSaves([item, ...saves]);
+    setSaveName("");
+  };
+
+  const loadSave = (item) => {
+    const d = item.data;
+    setPresetKey(d.presetKey || "custom");
+    setSliderMin(d.sliderMin ?? sliderMin);
+    setSliderMax(d.sliderMax ?? sliderMax);
+    setStarters(d.starters || defaultStarters);
+
+    const f = d.fields || {};
+    setHydration(f.hydration ?? hydration);
+    setFinalWeight(f.finalWeight ?? finalWeight);
+    setFlourToAdd(f.flourToAdd ?? flourToAdd);
+    setWaterToAdd(f.waterToAdd ?? waterToAdd);
+
+    setLocked(d.locked || locked);
+
+    const a = d.additives || {};
+    setSaltPct(a.saltPct ?? saltPct);
+    setFatPct(a.fatPct ?? fatPct);
+    setHoneyPct(a.honeyPct ?? honeyPct);
+  };
+
+  const deleteSave = (id) => {
+    persistSaves(saves.filter((s) => s.id !== id));
+  };
+
+  const warnings = useMemo(() => {
+    const w = [];
+    if (solved.totals.totalFlour <= 0) w.push("Суммарная мука ≤ 0 — проверьте входные данные.");
+    if (solved.waterToAdd < 0) w.push("Добавляемая вода отрицательная: закваски уже дают больше воды, чем нужно.");
+    if (solved.flourToAdd < 0) w.push("Добавляемая мука отрицательная: закваски уже дают больше муки, чем нужно.");
+    // если фиксаций слишком мало
+    const fixedCount = Object.values(locked).filter(Boolean).length;
+    if (fixedCount < 2) w.push("Для точного расчёта зафиксируй хотя бы 2 параметра (например: гидрация + вес).");
+    return w;
+  }, [solved, locked]);
+
+  return (
+    <div className="min-h-screen bg-gray-50 p-6">
+      <div className="max-w-5xl mx-auto space-y-6">
+        <div>
+          <h1 className="text-2xl font-bold">Калькулятор гидрации теста</h1>
+          <p className="text-sm text-gray-600">
+            Поля <span className="px-2 py-0.5 rounded bg-blue-50 border border-blue-200">синие</span> — зафиксированы (ввод),
+            поля <span className="px-2 py-0.5 rounded bg-gray-50 border border-gray-200">серые</span> — рассчитаны.
+          </p>
+        </div>
+
+        {/* PRESETS */}
+        <div className="bg-white rounded shadow p-4 space-y-3">
+          <div className="flex flex-wrap items-center justify-between gap-3">
+            <div>
+              <div className="font-semibold">Тип теста (пресеты)</div>
+              <div className="text-sm text-gray-600">{preset.note}</div>
+            </div>
+            <select
+              className="border rounded px-3 py-2 bg-white"
+              value={presetKey}
+              onChange={(e) => setPresetKey(e.target.value)}
+            >
+              {PRESETS.map((p) => (
+                <option key={p.key} value={p.key}>
+                  {p.title}
+                </option>
+              ))}
+            </select>
+          </div>
+        </div>
+
+        <div className="grid lg:grid-cols-3 gap-6">
+          {/* INPUTS */}
+          <div className="bg-white rounded shadow p-4 space-y-4 lg:col-span-1">
+            <h2 className="font-semibold">Параметры</h2>
+
+            <LockedField
+              label="Гидрация (%)"
+              value={hydration}
+              locked={locked.hydration}
+              onToggle={() => toggleLock("hydration")}
+              onChange={(v) => setHydration(v)}
+              inputClass={inputClass}
+              pill={pill}
+              extra={
+                <input
+                  type="range"
+                  min={sliderMin}
+                  max={sliderMax}
+                  value={hydration}
+                  onChange={(e) => setHydration(+e.target.value)}
+                  className="w-full"
+                />
+              }
+            />
+
+            <LockedField
+              label="Итоговая масса теста (г)"
+              value={finalWeight}
+              locked={locked.finalWeight}
+              onToggle={() => toggleLock("finalWeight")}
+              onChange={(v) => setFinalWeight(v)}
+              inputClass={inputClass}
+              pill={pill}
+            />
+
+            <LockedField
+              label="Добавить муки (г)"
+              value={flourToAdd}
+              locked={locked.flourToAdd}
+              onToggle={() => toggleLock("flourToAdd")}
+              onChange={(v) => setFlourToAdd(v)}
+              inputClass={inputClass}
+              pill={pill}
+            />
+
+            <LockedField
+              label="Добавить воды (г)"
+              value={waterToAdd}
+              locked={locked.waterToAdd}
+              onToggle={() => toggleLock("waterToAdd")}
+              onChange={(v) => setWaterToAdd(v)}
+              inputClass={inputClass}
+              pill={pill}
+            />
+
+            {warnings.length > 0 && (
+              <div className="bg-amber-50 border border-amber-200 rounded p-3 text-sm text-amber-800 space-y-1">
+                {warnings.map((x, i) => (
+                  <div key={i}>• {x}</div>
+                ))}
+              </div>
+            )}
+          </div>
+
+          {/* STARTERS */}
+          <div className="bg-white rounded shadow p-4 space-y-4 lg:col-span-1">
+            <div className="flex items-center justify-between">
+              <h2 className="font-semibold">Закваски</h2>
+              <button
+                className="px-3 py-1.5 rounded border bg-white text-sm"
+                onClick={() =>
+                  setStarters((prev) => [
+                    ...prev,
+                    {
+                      id: (prev.at(-1)?.id || 0) + 1,
+                      name: `Закваска ${prev.length + 1}`,
+                      weight: 100,
+                      hydration: 100,
+                    },
+                  ])
+                }
+              >
+                + добавить
+              </button>
+            </div>
+
+            <div className="space-y-3">
+              {starters.map((s) => {
+                const parts = splitStarter(s.weight, s.hydration);
+                return (
+                  <div key={s.id} className="border rounded p-3 bg-gray-50">
+                    <div className="flex items-center justify-between gap-2">
+                      <input
+                        className="font-medium bg-white border rounded px-2 py-1 w-full"
+                        value={s.name}
+                        onChange={(e) => updateStarter(s.id, "name", e.target.value)}
+                      />
+                      <button
+                        className="text-xs underline text-gray-600"
+                        onClick={() => setStarters((prev) => prev.filter((x) => x.id !== s.id))}
+                      >
+                        удалить
+                      </button>
+                    </div>
+
+                    <div className="grid grid-cols-2 gap-2 mt-2">
+                      <div>
+                        <label className="text-sm text-gray-700">Вес (г)</label>
+                        <input
+                          type="number"
+                          value={s.weight}
+                          onChange={(e) => updateStarter(s.id, "weight", +e.target.value)}
+                          className="border rounded px-2 py-1 w-full bg-white"
+                        />
+                      </div>
+                      <div>
+                        <label className="text-sm text-gray-700">Гидрация (%)</label>
+                        <input
+                          type="number"
+                          value={s.hydration}
+                          onChange={(e) => updateStarter(s.id, "hydration", +e.target.value)}
+                          className="border rounded px-2 py-1 w-full bg-white"
+                        />
+                      </div>
+                    </div>
+
+                    <div className="text-sm text-gray-600 mt-2">
+                      В составе: <b>{parts.flour.toFixed(1)} г</b> муки / <b>{parts.water.toFixed(1)} г</b> воды
+                    </div>
+                  </div>
+                );
+              })}
+            </div>
+          </div>
+
+          {/* ADDITIVES */}
+          <div className="bg-white rounded shadow p-4 space-y-4 lg:col-span-1">
+            <div>
+              <h2 className="font-semibold">Добавки (не влияют на гидрацию)</h2>
+              <div className="text-sm text-gray-600">Проценты считаются от суммарной муки (включая муку из заквасок).</div>
+            </div>
+
+            <PctRow label="Соль (%)" value={saltPct} onChange={setSaltPct} grams={additives.saltG} hint="Обычно 1.8–2.2%" />
+            <PctRow label="Жир/масло (%)" value={fatPct} onChange={setFatPct} grams={additives.fatG} hint="Напр. 2–5%" />
+            <PctRow label="Мёд/сахар (%)" value={honeyPct} onChange={setHoneyPct} grams={additives.honeyG} hint="Для сладости/цвета" />
+
+            <div className="bg-gray-50 border rounded p-3 text-sm space-y-1">
+              <div>
+                Основа расчёта: <b>{additives.flour.toFixed(1)} г</b> муки
+              </div>
+              <div>
+                Добавки всего: <b>{additives.totalG.toFixed(1)} г</b>
+              </div>
+            </div>
+          </div>
+        </div>
+
+        {/* RESULTS + SAVE */}
+        <div className="bg-green-50 border border-green-200 rounded p-4">
+          <div className="flex flex-wrap items-start justify-between gap-4">
+            <div className="space-y-1">
+              <div className="font-semibold">Итоги (с учётом заквасок)</div>
+              <div className="text-sm">
+                Суммарная мука: <b>{solved.totals.totalFlour.toFixed(1)} г</b> (из заквасок {solved.totals.startersFlour.toFixed(1)} г)
+              </div>
+              <div className="text-sm">
+                Суммарная вода: <b>{solved.totals.totalWater.toFixed(1)} г</b> (из заквасок {solved.totals.startersWater.toFixed(1)} г)
+              </div>
+              <div className="text-sm">
+                Итоговая гидрация: <b>{solved.hydration.toFixed(1)}%</b>
+              </div>
+              <div className="text-sm">
+                Итоговый вес теста: <b>{solved.finalWeight.toFixed(1)} г</b>
+              </div>
+            </div>
+
+            <div className="min-w-[280px] space-y-2">
+              <div className="font-semibold">Сохранить расчёт</div>
+              <div className="flex gap-2">
+                <input
+                  className="border rounded px-2 py-2 w-full"
+                  placeholder="Имя (например: Батард 72%)"
+                  value={saveName}
+                  onChange={(e) => setSaveName(e.target.value)}
+                />
+                <button className="px-3 py-2 rounded bg-green-600 text-white" onClick={doSave}>
+                  Сохранить
+                </button>
+              </div>
+              <div className="text-xs text-gray-600">Сохраняется в браузере (localStorage).</div>
+            </div>
+          </div>
+        </div>
+
+        {/* SAVES LIST */}
+        <div className="bg-white rounded shadow p-4 space-y-3">
+          <div className="flex items-center justify-between">
+            <h2 className="font-semibold">Сохранённые расчёты</h2>
+            {saves.length > 0 && (
+              <button className="text-xs underline text-gray-600" onClick={() => persistSaves([])}>
+                очистить все
+              </button>
+            )}
+          </div>
+
+          {saves.length === 0 ? (
+            <div className="text-sm text-gray-600">Пока ничего не сохранено.</div>
+          ) : (
+            <div className="space-y-2">
+              {saves.map((s) => (
+                <div key={s.id} className="flex flex-wrap items-center justify-between gap-2 border rounded p-3 bg-gray-50">
+                  <div>
+                    <div className="font-medium">{s.name}</div>
+                    <div className="text-xs text-gray-600">
+                      {fmtDate(s.createdAt)} • {s.data.fields?.finalWeight?.toFixed?.(0) ?? "—"} г • {s.data.fields?.hydration?.toFixed?.(1) ?? "—"}%
+                    </div>
+                  </div>
+                  <div className="flex gap-2">
+                    <button className="px-3 py-1.5 rounded bg-white border" onClick={() => loadSave(s)}>
+                      Загрузить
+                    </button>
+                    <button className="px-3 py-1.5 rounded bg-white border" onClick={() => deleteSave(s.id)}>
+                      Удалить
+                    </button>
+                  </div>
+                </div>
+              ))}
+            </div>
+          )}
+        </div>
+      </div>
+    </div>
+  );
+}
+
+function LockedField({ label, value, locked, onToggle, onChange, inputClass, pill, extra }) {
+  return (
+    <div className="space-y-2">
+      <div className="flex items-center justify-between">
+        <label className="font-medium">{label}</label>
+        <div className="flex items-center gap-3">
+          <span className={pill(locked)}>{locked ? "фиксировано" : "расчёт"}</span>
+          <label className="text-xs text-gray-700 flex items-center gap-2 select-none">
+            <input type="checkbox" checked={locked} onChange={onToggle} />
+            фиксировать
+          </label>
+        </div>
+      </div>
+      <input
+        type="number"
+        step="0.1"
+        value={value}
+        onChange={(e) => onChange(+e.target.value)}
+        className={inputClass(locked)}
+      />
+      {extra}
+    </div>
+  );
+}
+
+function PctRow({ label, value, onChange, grams, hint }) {
+  return (
+    <div className="border rounded p-3 bg-gray-50 space-y-2">
+      <div className="flex items-end justify-between gap-2">
+        <div className="min-w-[140px]">
+          <div className="font-medium">{label}</div>
+          <div className="text-xs text-gray-600">{hint}</div>
+        </div>
+        <div className="w-full">
+          <input
+            type="number"
+            step="0.1"
+            value={value}
+            onChange={(e) => onChange(+e.target.value)}
+            className="border rounded px-2 py-2 w-full bg-white"
+          />
+        </div>
+      </div>
+      <div className="text-sm text-gray-700">
+        Это: <b>{grams.toFixed(1)} г</b>
+      </div>
+    </div>
+  );
+}
